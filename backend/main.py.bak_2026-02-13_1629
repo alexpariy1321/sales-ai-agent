@@ -1,0 +1,224 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import json
+import subprocess
+import threading
+import time
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+try:
+    from backend.managers_map import get_rus_name
+except ImportError:
+    def get_rus_name(name): return name.replace("_", " ")
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_DIR = "/root/sales-ai-agent/data/archive"
+PROMPT_FILE = "/root/sales-ai-agent/data/current_prompt.json"
+REPORT_PROMPT_FILE = "/root/sales-ai-agent/data/report_prompt.json"
+SCRIPTS_DIR = "/root/sales-ai-agent/scripts"
+STATUS_FILE = "/root/sales-ai-agent/data/system_status.json"
+
+if not os.path.exists(STATUS_FILE):
+    with open(STATUS_FILE, "w") as f:
+        json.dump({"is_syncing": False, "is_processing": False, "is_generating": False}, f)
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class PromptModel(BaseModel):
+    prompt: str
+
+def update_status(key, value):
+    try:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, "r") as f: data = json.load(f)
+        else: data = {}
+        data[key] = value
+        with open(STATUS_FILE, "w") as f: json.dump(data, f)
+    except: pass
+
+def run_sync_task():
+    update_status("is_syncing", True)
+    try:
+        subprocess.run(["/root/sales-ai-agent/venv/bin/python3", os.path.join(SCRIPTS_DIR, "download_calls.py")], check=True)
+    except Exception as e:
+        update_status("last_error", str(e))
+    finally:
+        update_status("is_syncing", False)
+        update_status("sync_progress", "Завершено")
+
+def run_process_task():
+    update_status("is_processing", True)
+    update_status("process_progress", "Анализ...")
+    try:
+        subprocess.run(["/root/sales-ai-agent/venv/bin/python3", os.path.join(SCRIPTS_DIR, "process_all_new.py")], check=True)
+        update_status("process_progress", "Готово")
+    except Exception as e:
+        update_status("last_error", str(e))
+    finally:
+        update_status("is_processing", False)
+
+def run_report_task(week):
+    update_status("is_generating", True)
+    try:
+        subprocess.run(["/root/sales-ai-agent/venv/bin/python3", os.path.join(SCRIPTS_DIR, "generate_weekly_report.py")], check=True)
+    except Exception as e:
+        update_status("last_error", str(e))
+    finally:
+        update_status("is_generating", False)
+
+@app.post("/api/login")
+def login(req: LoginRequest):
+    if req.username == "admin" and req.password == "admin": return {"token": "fake"}
+    raise HTTPException(status_code=401)
+
+@app.get("/api/status")
+def get_status():
+    if os.path.exists(STATUS_FILE):
+        with open(STATUS_FILE, "r") as f: return json.load(f)
+    return {}
+
+@app.post("/api/sync")
+def start_sync():
+    threading.Thread(target=run_sync_task).start()
+    return {"status": "ok", "message": "Синхронизация..."}
+
+@app.post("/api/process")
+def start_process():
+    threading.Thread(target=run_process_task).start()
+    return {"status": "ok", "message": "Анализ..."}
+
+@app.post("/api/generate_report")
+def start_report():
+    threading.Thread(target=run_report_task, args=("all",)).start()
+    return {"status": "ok", "message": "Отчет..."}
+
+@app.get("/api/structure")
+def get_structure():
+    structure = {}
+    if not os.path.exists(BASE_DIR): return structure
+    weeks = sorted(os.listdir(BASE_DIR))
+    for week in weeks:
+        week_path = os.path.join(BASE_DIR, week)
+        if not os.path.isdir(week_path): continue
+        structure[week] = {}
+        for company in os.listdir(week_path):
+            comp_path = os.path.join(week_path, company)
+            if not os.path.isdir(comp_path): continue
+            managers = []
+            for m in os.listdir(comp_path):
+                m_path = os.path.join(comp_path, m)
+                if os.path.isdir(m_path):
+                    audio_count = len([f for f in os.listdir(os.path.join(m_path, "audio")) if f.endswith('.mp3')]) if os.path.exists(os.path.join(m_path, "audio")) else 0
+                    report_exists = os.path.exists(os.path.join(m_path, f"WEEKLY_REPORT_{m}.md"))
+                    managers.append({
+                        "id": m,
+                        "name": get_rus_name(m),
+                        "calls_count": audio_count,
+                        "has_weekly_report": report_exists
+                    })
+            structure[week][company] = managers
+    return structure
+
+@app.get("/api/calls/{week}/{company}/{manager}")
+def get_calls(week: str, company: str, manager: str):
+    target_dir = os.path.join(BASE_DIR, week, company, manager)
+    audio_dir = os.path.join(target_dir, "audio")
+    if not os.path.exists(audio_dir): return []
+    
+    calls = []
+    files = sorted(os.listdir(audio_dir))
+    
+    # Регулярка для твоих форматов:
+    # Ищет паттерн YYYY_MM_DD-HH_MM_SS (например 2026_02_10-11_45_32)
+    # Группы: 1=год, 2=мес, 3=день, 4=час, 5=мин, 6=сек
+    date_pattern = re.compile(r"(\d{4})_(\d{2})_(\d{2})[-_](\d{2})_(\d{2})_(\d{2})")
+    
+    for file in files:
+        if file.endswith(".mp3"):
+            has_report = os.path.exists(os.path.join(target_dir, "report", file.replace(".mp3", ".md")))
+            
+            # Парсим дату
+            match = date_pattern.search(file)
+            if match:
+                y, m, d, hh, mm, ss = match.groups()
+                # Красивая дата для UI
+                display_date = f"{d}.{m}.{y} {hh}:{mm}"
+                # Дата для сортировки (timestamp)
+                sort_key = f"{y}{m}{d}{hh}{mm}{ss}"
+            else:
+                # Если вдруг формат другой - берем дату создания файла
+                filepath = os.path.join(audio_dir, file)
+                try:
+                    ts = os.path.getctime(filepath)
+                    dt = datetime.fromtimestamp(ts)
+                    display_date = dt.strftime("%d.%m.%Y %H:%M")
+                    sort_key = dt.strftime("%Y%m%d%H%M%S")
+                except:
+                    display_date = "Unknown"
+                    sort_key = "0"
+
+            calls.append({
+                "id": file, 
+                "filename": file, 
+                "date": display_date, 
+                "sort_key": sort_key, # Для сортировки
+                "has_transcript": has_report,
+                "audio_url": f"/api/audio/{week}/{company}/{manager}/{file}"
+            })
+    
+    # Сортируем: от новых к старым (DESC)
+    calls.sort(key=lambda x: x["sort_key"], reverse=True)
+    
+    return calls
+
+@app.get("/api/audio/{week}/{company}/{manager}/{filename}")
+def get_audio(week: str, company: str, manager: str, filename: str):
+    path = os.path.join(BASE_DIR, week, company, manager, "audio", filename)
+    return FileResponse(path) if os.path.exists(path) else HTTPException(404)
+
+@app.get("/api/prompt")
+def get_prompt(type: str = "call"):
+    target_file = REPORT_PROMPT_FILE if type == "report" else PROMPT_FILE
+    default = "Анализируй..."
+    if os.path.exists(target_file):
+        try:
+            with open(target_file, 'r', encoding='utf-8') as f: return {"prompt": json.load(f).get("prompt", default)}
+        except: pass
+    return {"prompt": default}
+
+@app.post("/api/prompt")
+def save_prompt(data: PromptModel, type: str = "call"):
+    target_file = REPORT_PROMPT_FILE if type == "report" else PROMPT_FILE
+    with open(target_file, 'w', encoding='utf-8') as f:
+        json.dump({"prompt": data.prompt}, f, ensure_ascii=False, indent=2)
+    return {"status": "ok", "message": "Saved"}
+
+@app.get("/api/analysis/{week}/{company}/{manager}/{filename}")
+def get_analysis(week: str, company: str, manager: str, filename: str):
+    path = os.path.join(BASE_DIR, week, company, manager, "report", filename.replace(".mp3", ".md"))
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f: return {"analysis": f.read()}
+    return {"analysis": "Not found"}
+
+@app.get("/api/weekly_report/{week}/{company}/{manager}")
+def get_weekly_report(week: str, company: str, manager: str):
+    path = os.path.join(BASE_DIR, week, company, manager, f"WEEKLY_REPORT_{manager}.md")
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f: return {"report": f.read()}
+    return {"report": "Отчет еще не сгенерирован."}

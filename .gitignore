@@ -1,0 +1,28 @@
+# Виртуальное окружение
+venv/
+
+# Логи
+*.log
+/tmp/
+nohup.out
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Node / фронтенд
+echo-frontend/node_modules/
+echo-frontend/dist/
+
+# Конфиги с токенами
+.env
+env.txt
+
+# Данные звонков и отчеты (реальные файлы)
+data/archive/
+data/system_status.json
+data/prompts.json
+
+# Разное
+.idea/
+.vscode/

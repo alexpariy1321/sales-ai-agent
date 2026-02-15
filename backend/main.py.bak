@@ -1,0 +1,110 @@
+# -*- coding: utf-8 -*-
+import os
+import time
+from fastapi import FastAPI, HTTPException, Request, Body
+from dotenv import load_dotenv
+
+load_dotenv()
+
+APP_NAME = "sales-ai-agent"
+
+SO_SECRET = os.getenv("SO_WEBHOOK_SECRET", "")
+UN_SECRET = os.getenv("UN_WEBHOOK_SECRET", "")
+
+app = FastAPI(title=APP_NAME, version="0.1.0")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "app": APP_NAME, "ts": time.time()}
+
+def _check_secret(expected: str):
+    if not expected:
+        raise HTTPException(status_code=500, detail="Webhook secret is not set on server")
+
+@app.post("/webhook/standard-oil/{secret}")
+async def webhook_standard_oil(secret: str, request: Request):
+    _check_secret(SO_SECRET)
+    if secret != SO_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    payload = await request.json()
+    return {"status": "accepted", "dept": "standard-oil", "received_keys": list(payload.keys())}
+
+@app.post("/webhook/ural-nerud/{secret}")
+async def webhook_ural_nerud(secret: str, request: Request):
+    _check_secret(UN_SECRET)
+    if secret != UN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    payload = await request.json()
+    return {"status": "accepted", "dept": "ural-nerud", "received_keys": list(payload.keys())}
+
+import requests
+
+UN_BITRIX = os.getenv("UN_BITRIX_WEBHOOK_BASE", "")
+SO_BITRIX = os.getenv("SO_BITRIX_WEBHOOK_BASE", "")
+
+def _bitrix_get(base: str, method: str, params: dict | None = None):
+    if not base:
+        raise HTTPException(status_code=500, detail="Bitrix webhook base is not set")
+    url = base + method
+    r = requests.get(url, params=params or {}, timeout=20)
+    return r.status_code, r.json()
+
+@app.get("/api/so/last-calls")
+async def so_last_calls():
+    code, data = _bitrix_get(SO_BITRIX, "voximplant.statistic.get.json", {"ORDER": {"CALL_START_DATE": "DESC"}, "FILTER": {}, "LIMIT": 3})
+    return {"http": code, "dept": "SO", "data": data}
+
+@app.get("/api/un/last-calls")
+async def un_last_calls():
+    code, data = _bitrix_get(UN_BITRIX, "voximplant.statistic.get.json", {"ORDER": {"CALL_START_DATE": "DESC"}, "FILTER": {}, "LIMIT": 3})
+    return {"http": code, "dept": "UN", "data": data}
+
+import json
+from datetime import datetime
+from fastapi import Query
+
+EXPORT_DIR = "/root/sales-ai-agent/data/raw"
+
+
+def _ensure_export_dir():
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+
+
+@app.post("/api/so/export-calls")
+async def so_export_calls(
+    date_from: str = Body(..., embed=True),
+    date_to: str = Body(..., embed=True),
+    limit: int = Body(200, embed=True),
+):
+    """
+    Выгружает звонки SO за период [date_from, date_to] и сохраняет в файл JSON.
+    Формат дат: '2025-09-01T00:00:00Z' или '2025-09-01'.
+    """
+    _ensure_export_dir()
+    code, data = _bitrix_get(
+        SO_BITRIX,
+        "voximplant.statistic.get.json",
+        {
+            "FILTER": {
+                ">CALL_START_DATE": date_from,
+                "<=CALL_START_DATE": date_to,
+            },
+            "ORDER": {"CALL_START_DATE": "ASC"},
+            "LIMIT": limit,
+        },
+    )
+    if code != 200:
+        raise HTTPException(status_code=502, detail=data)
+
+    fname = os.path.join(
+        EXPORT_DIR,
+        f"so_calls_{date_from.replace(':','-')}_{date_to.replace(':','-')}.json",
+    )
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return {"status": "ok", "http": code, "file": fname, "count": len(data.get("result", []))}
+
+# Транскрибация
+from backend.api_transcribe import router as transcribe_router
+app.include_router(transcribe_router)

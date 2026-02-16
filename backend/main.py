@@ -235,3 +235,73 @@ def get_transcript(week: str, company: str, manager: str, filename: str):
             return {"content": f"Error reading file: {str(e)}"}
             
     return {"content": "Транскрипция не найдена."}
+
+
+
+class AnalyzeRequest(BaseModel):
+    week: str
+    company: str
+    manager: str
+    force: bool = False
+
+@app.post("/api/analyze_manager")
+def analyze_manager_endpoint(req: AnalyzeRequest):
+    # Проверяем, есть ли отчет
+    report_path = os.path.join(BASE_DIR, req.week, req.company, req.manager, "report", f"WEEKLY_REPORT_{req.manager}.json")
+    
+    if os.path.exists(report_path) and not req.force:
+        return {"status": "exists", "message": "Отчет уже существует. Перезаписать?"}
+
+    # Запускаем в отдельном потоке (но статус будем писать локально для менеджера, это сложнее, пока просто запустим)
+    # Чтобы не блокировать, запускаем тред
+    def run():
+        update_status(f"analyzing_{req.manager}", True) # Флаг конкретного менеджера в статусе? Пока используем глобальный или просто лог
+        try:
+            script = os.path.join(SCRIPTS_DIR, "analyze_manager.py")
+            python = "/root/sales-ai-agent/venv/bin/python3"
+            subprocess.run([python, script, "--week", req.week, "--company", req.company, "--manager", req.manager], check=True)
+        finally:
+            update_status(f"analyzing_{req.manager}", False)
+
+    threading.Thread(target=run).start()
+    return {"status": "started", "message": "Анализ запущен"}
+
+
+
+@app.get("/api/report/{week}/{company}/{manager}")
+def get_report(week: str, company: str, manager: str):
+    # Пытаемся найти Markdown отчет
+    report_name = f"WEEKLY_REPORT_{manager}.md"
+    path = os.path.join(BASE_DIR, week, company, manager, "report", report_name)
+    
+    headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+
+    if os.path.exists(path):
+        return FileResponse(path, headers=headers)
+    
+    # Если MD нет, ищем JSON
+    json_name = f"WEEKLY_REPORT_{manager}.json"
+    json_path = os.path.join(BASE_DIR, week, company, manager, "report", json_name)
+    if os.path.exists(json_path):
+        return FileResponse(json_path, headers=headers)
+
+    raise HTTPException(status_code=404, detail="Отчет не найден")
+
+
+
+@app.get("/api/prompts")
+def get_prompts():
+    if os.path.exists(PROMPTS_FILE):
+        with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+class PromptsUpdate(BaseModel):
+    system: str
+    companies: dict
+
+@app.post("/api/prompts")
+def save_prompts(data: PromptsUpdate):
+    with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data.dict(), f, ensure_ascii=False, indent=2)
+    return {"status": "saved"}

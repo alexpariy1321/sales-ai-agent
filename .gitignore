@@ -1,28 +1,20 @@
-# Виртуальное окружение
-venv/
-
-# Логи
-*.log
-/tmp/
-nohup.out
-
-# Python cache
-__pycache__/
-*.pyc
-
-# Node / фронтенд
-echo-frontend/node_modules/
-echo-frontend/dist/
-
-# Конфиги с токенами
-.env
-env.txt
-
-# Данные звонков и отчеты (реальные файлы)
+# 1. Игнорируем данные (самое важное!)
 data/archive/
 data/system_status.json
 data/prompts.json
+*.mp3
+*.wav
+*.txt
+*.md
 
-# Разное
+# 2. Игнорируем секреты
+.env
+env.txt
+
+# 3. Игнорируем виртуальное окружение и кэши
+venv/
+__pycache__/
+*.pyc
+.DS_Store
 .idea/
 .vscode/

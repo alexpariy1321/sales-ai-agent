@@ -1,147 +1,143 @@
-# -*- coding: utf-8 -*-
 import os
 import requests
 import json
 import time
-import sys
-from urllib.parse import urlparse
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# Отключаем буферизацию вывода
-sys.stdout.reconfigure(line_buffering=True)
-
-load_dotenv("/root/sales-ai-agent/.env")
-ENV = os.environ
-PROXIES = {"http": ENV.get("PROXY_URL"), "https": ENV.get("PROXY_URL")} if ENV.get("PROXY_URL") else None
-
-CONFIG = {
-    "UN": {
-        "webhook": ENV.get("UN_BITRIX_WEBHOOK_BASE"),
-        "managers": {
-            "79221610964": "Garyaev_Maxim",
-            "79221421423": "Popov_Denis",
-            "79292021732": "Ahmedshin_Dmitry",
-        }
-    },
-    "SO": {
-        "webhook": ENV.get("SO_BITRIX_WEBHOOK_BASE"),
-        "managers": {
-            "14": "Volkov_Ivan",
-            "volkov_ivan": "Volkov_Ivan"
-        }
-    }
-}
-
+# --- КОНФИГУРАЦИЯ ---
+BASE_DIR = "/root/sales-ai-agent"
 DATA_DIR = "/root/sales-ai-agent/data/archive"
 STATUS_FILE = "/root/sales-ai-agent/data/system_status.json"
+ENV_FILE = "/root/sales-ai-agent/.env"
 
-def update_ui_status(message):
-    print(message)
+load_dotenv(ENV_FILE)
+
+UN_WEBHOOK = os.getenv("UN_BITRIX_WEBHOOK_BASE")
+SO_WEBHOOK = os.getenv("SO_BITRIX_WEBHOOK_BASE")
+
+# ПРОКСИ ВООБЩЕ НЕ ИСПОЛЬЗУЕМ
+# PROXY_URL = os.getenv("PROXY_URL") 
+PROXIES = {} # Пустой словарь = прямое соединение
+
+UN_MANAGERS = {
+    "79221610964": "Garyaev_Maxim",
+    "79221421423": "Popov_Denis", 
+    "79292021732": "Ahmedshin_Dmitry"
+}
+
+def update_status(msg, is_syncing=True):
+    print(f"STATUS: {msg}")
+    data = {"issyncing": is_syncing, "syncprogress": msg}
     try:
-        if os.path.exists(STATUS_FILE):
-            with open(STATUS_FILE, "r") as f: data = json.load(f)
-        else: data = {}
-        data["sync_progress"] = message
-        if "ГОТОВО" in message: data["is_syncing"] = False
-        with open(STATUS_FILE, "w") as f: json.dump(data, f)
+        with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
     except: pass
 
-def get_week_dates():
+def get_current_week_dates():
     today = datetime.now()
     start = today - timedelta(days=today.weekday())
-    end = start + timedelta(days=6)
-    return start, end
+    return start, start + timedelta(days=6)
 
-def run():
-    start_dt, end_dt = get_week_dates()
-    DATE_START = start_dt.strftime("%Y-%m-%dT00:00:00")
-    DATE_END = end_dt.strftime("%Y-%m-%dT23:59:59")
+def download_file(url, path):
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return False
     
-    FOLDER_NAME = f"{start_dt.strftime('%Y-%m-%d')}_{end_dt.strftime('%Y-%m-%d')}"
-    BASE_PATH = os.path.join(DATA_DIR, FOLDER_NAME)
-    
-    update_ui_status(f"Запуск: {FOLDER_NAME}")
-    os.makedirs(BASE_PATH, exist_ok=True)
-    
-    PROGRESS_FILE = os.path.join(BASE_PATH, "progress_state.json")
-    progress = {}
-    
-    # ИСПРАВЛЕННЫЙ БЛОК TRY
-    if os.path.exists(PROGRESS_FILE):
-        try: 
-            with open(PROGRESS_FILE, "r") as f: 
-                progress = json.load(f)
-        except: 
-            pass
+    try:
+        # Убрали proxies=PROXIES
+        r = requests.get(url, stream=True, timeout=60)
+        if r.status_code == 200:
+            with open(path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"✅ SAVED: {path}")
+            return True
+        else:
+            print(f"❌ HTTP Error {r.status_code} for {url}")
+    except Exception as e:
+        print(f"❌ Download Error: {e}")
+    return False
 
-    for co_code, data in CONFIG.items():
-        if not data["webhook"]: continue
-        
-        update_ui_status(f"Компания {co_code}...")
-        start_offset = progress.get(co_code, 0)
-        
-        while True:
-            params = {
-                "FILTER[>=CALL_START_DATE]": DATE_START,
-                "FILTER[<=CALL_START_DATE]": DATE_END,
-                "FILTER[!CALL_RECORD_URL]": "null",
-                "start": start_offset,
-            }
+def process_company(code, webhook, start, end, folder):
+    if not webhook: return 0
+    url = f"{webhook}voximplant.statistic.get.json"
+    
+    params = {
+        "FILTER[>=CALL_START_DATE]": start.strftime("%Y-%m-%dT00:00:00"),
+        "FILTER[<=CALL_START_DATE]": end.strftime("%Y-%m-%dT23:59:59"),
+        "FILTER[!=CALL_RECORD_URL]": "null"
+    }
+    if code == "SO": params["FILTER[PORTAL_USER_ID]"] = 14
+    
+    total = 0
+    next_start = 0
+    
+    update_status(f"Запрос {code} (прямое соединение)...")
+    
+    while True:
+        p = params.copy(); p["start"] = next_start
+        try:
+            # Убрали proxies=PROXIES
+            r = requests.get(url, params=p, timeout=30)
+            data = r.json()
+            calls = data.get("result", [])
+            
+            if not calls: break
+            
+            for call in calls:
+                mgr = "Unknown"
+                if code == "UN":
+                    num = str(call.get("PORTAL_NUMBER", "")).replace("+", "")
+                    mgr = UN_MANAGERS.get(num, "Unknown_UN")
+                elif code == "SO": mgr = "Volkov_Ivan"
+                
+                if "Unknown" in mgr: continue
+                
+                mgr_dir = os.path.join(DATA_DIR, folder, code, mgr)
+                os.makedirs(os.path.join(mgr_dir, "audio"), exist_ok=True)
+                os.makedirs(os.path.join(mgr_dir, "transcripts"), exist_ok=True)
+                os.makedirs(os.path.join(mgr_dir, "report"), exist_ok=True)
+                
+                rec_url = call.get("CALL_RECORD_URL")
+                if not rec_url: continue
+                
+                fname = os.path.basename(urlparse(rec_url).path)
+                if not fname or len(fname) < 5:
+                    dt = call.get('CALL_START_DATE', '').replace(':', '_').replace('-', '_').replace('T', '_')
+                    fname = f"call_{call.get('ID')}_{dt}.mp3"
+                
+                target_path = os.path.join(mgr_dir, "audio", fname)
+                
+                if download_file(rec_url, target_path):
+                    total += 1
+                    update_status(f"Скачан {code}: {fname}")
+            
+            if "next" in data: 
+                next_start = data["next"]
+                time.sleep(0.5)
+            else: break
+            
+        except Exception as e:
+            print(f"Error {code}: {e}")
+            break
+            
+    return total
 
-            try:
-                url = f"{data['webhook']}voximplant.statistic.get.json"
-                
-                if co_code == "SO":
-                    params["FILTER[PORTAL_USER_ID]"] = 14
-                
-                r = requests.get(url, params=params, proxies=PROXIES, timeout=60).json()
-                calls = r.get("result", [])
-                
-                if not calls: break
-                
-                update_ui_status(f"{co_code}: Стр. {start_offset//50 + 1} ({len(calls)} зв.)")
-                
-                for c in calls:
-                    rec_url = str(c.get("CALL_RECORD_URL", "")).lower()
-                    p_num = str(c.get("PORTAL_NUMBER", ""))
-                    p_user = str(c.get("PORTAL_USER_ID", ""))
-                    
-                    mgr_name = None
-                    if co_code == "UN":
-                        p_num_clean = "".join(filter(str.isdigit, p_num))
-                        mgr_name = data["managers"].get(p_num_clean)
-                    else:
-                        if p_user == "14": mgr_name = "Volkov_Ivan"
-                        elif "volkov_ivan" in rec_url: mgr_name = "Volkov_Ivan"
-                    
-                    if mgr_name:
-                        mgr_dir = os.path.join(BASE_PATH, co_code, mgr_name)
-                        os.makedirs(os.path.join(mgr_dir, "audio"), exist_ok=True)
-                        os.makedirs(os.path.join(mgr_dir, "report"), exist_ok=True)
-                        os.makedirs(os.path.join(mgr_dir, "transcripts"), exist_ok=True)
-                        
-                        f_name = os.path.basename(urlparse(c.get("CALL_RECORD_URL")).path)
-                        if not f_name or len(f_name) < 3: f_name = f"call_{c.get('ID')}.mp3"
-                        f_path = os.path.join(mgr_dir, "audio", f_name)
-                        
-                        if not os.path.exists(f_path):
-                            try:
-                                ra = requests.get(c.get("CALL_RECORD_URL"), timeout=90)
-                                if ra.status_code == 200:
-                                    with open(f_path, "wb") as f: f.write(ra.content)
-                            except: pass
-                
-                start_offset += 50
-                progress[co_code] = start_offset
-                with open(PROGRESS_FILE, "w") as f: json.dump(progress, f)
-                if len(calls) < 50: break
-                    
-            except Exception as e:
-                time.sleep(5)
-                continue
-
-    update_ui_status("ГОТОВО")
+def main():
+    start, end = get_current_week_dates()
+    folder = f"{start.strftime('%Y-%m-%d')}_{end.strftime('%Y-%m-%d')}"
+    
+    os.makedirs(os.path.join(DATA_DIR, folder), exist_ok=True)
+    
+    print(f"📂 Target Folder: {os.path.join(DATA_DIR, folder)}")
+    
+    c1 = process_company("UN", UN_WEBHOOK, start, end, folder)
+    c2 = process_company("SO", SO_WEBHOOK, start, end, folder)
+    
+    msg = f"Новых: {c1 + c2}"
+    update_status(msg, is_syncing=False)
+    print(msg)
 
 if __name__ == "__main__":
-    run()
+    main()

@@ -5,6 +5,7 @@ import json
 import subprocess
 import threading
 import time
+import asyncio
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +28,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# === SSE для автообновления UI ===
+active_connections = []
+
+@app.get("/api/events")
+async def sse_events():
+    """Server-Sent Events для push-уведомлений в UI"""
+    from starlette.responses import StreamingResponse
+    
+    async def event_generator():
+        queue = asyncio.Queue()
+        active_connections.append(queue)
+        try:
+            while True:
+                data = await queue.get()
+                yield f"data: {data}\n\n"
+        except asyncio.CancelledError:
+            active_connections.remove(queue)
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+async def broadcast_event(event_type: str):
+    """Отправить событие всем подключённым клиентам"""
+    message = json.dumps({"type": event_type, "timestamp": time.time()})
+    for queue in active_connections:
+        try:
+            await queue.put(message)
+        except:
+            pass
+
+
 
 # --- МОДЕЛИ ---
 class LoginRequest(BaseModel):
@@ -71,7 +104,10 @@ def run_script(script_name, status_key):
         update_status("lasterror", str(e))
     finally:
         update_status(status_key, False)
-
+        try:
+            asyncio.run(broadcast_event("refresh"))
+        except:
+            pass
 # --- API ENDPOINTS ---
 
 @app.get("/api/status")

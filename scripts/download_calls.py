@@ -13,18 +13,20 @@ STATUS_FILE = "/root/sales-ai-agent/data/system_status.json"
 ENV_FILE = "/root/sales-ai-agent/.env"
 
 load_dotenv(ENV_FILE)
-
 UN_WEBHOOK = os.getenv("UN_BITRIX_WEBHOOK_BASE")
 SO_WEBHOOK = os.getenv("SO_BITRIX_WEBHOOK_BASE")
 
-# ПРОКСИ ВООБЩЕ НЕ ИСПОЛЬЗУЕМ
-# PROXY_URL = os.getenv("PROXY_URL") 
-PROXIES = {} # Пустой словарь = прямое соединение
-
-UN_MANAGERS = {
-    "79221610964": "Garyaev_Maxim",
-    "79221421423": "Popov_Denis", 
-    "79292021732": "Ahmedshin_Dmitry"
+# MAPPING ID -> ПАПКА (ЛАТИНИЦА)
+MANAGERS_MAP = {
+    "UN": {
+        "231": "Garyaev_Maxim",   # Гаряев
+        "5":   "Ahmedshin_Dmitry",# Ахмедшин
+        "232": "Popov_Denis"      # Попов
+    },
+    "SO": {
+        "14": "Volkov_Ivan",      # Волков
+        "11": "Akimova_Ekaterina"   # <--- НОВЫЙ МЕНЕДЖЕР
+    }
 }
 
 def update_status(msg, is_syncing=True):
@@ -43,9 +45,7 @@ def get_current_week_dates():
 def download_file(url, path):
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return False
-    
     try:
-        # Убрали proxies=PROXIES
         r = requests.get(url, stream=True, timeout=60)
         if r.status_code == 200:
             with open(path, 'wb') as f:
@@ -61,24 +61,31 @@ def download_file(url, path):
 
 def process_company(code, webhook, start, end, folder):
     if not webhook: return 0
+    
+    # URL для звонков
     url = f"{webhook}voximplant.statistic.get.json"
     
+    # Фильтр по дате и наличию записи
     params = {
         "FILTER[>=CALL_START_DATE]": start.strftime("%Y-%m-%dT00:00:00"),
         "FILTER[<=CALL_START_DATE]": end.strftime("%Y-%m-%dT23:59:59"),
-        "FILTER[!=CALL_RECORD_URL]": "null"
+        "FILTER[!=CALL_RECORD_URL]": "null",
+        "SORT": "CALL_START_DATE",
+        "ORDER": "DESC"
     }
-    if code == "SO": params["FILTER[PORTAL_USER_ID]"] = 14
+
+    # ВАЖНО: Фильтруем по ID, если они заданы в MANAGERS_MAP
+    # Битрикс умеет фильтровать по списку ID (но не всегда через OR).
+    # Проще скачать всё за неделю и отфильтровать локально (так надежнее).
     
     total = 0
     next_start = 0
     
-    update_status(f"Запрос {code} (прямое соединение)...")
+    update_status(f"Запрос {code} (ищем {len(MANAGERS_MAP.get(code, {}))} менеджеров)...")
     
     while True:
         p = params.copy(); p["start"] = next_start
         try:
-            # Убрали proxies=PROXIES
             r = requests.get(url, params=p, timeout=30)
             data = r.json()
             calls = data.get("result", [])
@@ -86,19 +93,21 @@ def process_company(code, webhook, start, end, folder):
             if not calls: break
             
             for call in calls:
-                mgr = "Unknown"
-                if code == "UN":
-                    num = str(call.get("PORTAL_NUMBER", "")).replace("+", "")
-                    mgr = UN_MANAGERS.get(num, "Unknown_UN")
-                elif code == "SO": mgr = "Volkov_Ivan"
+                # Определяем менеджера по PORTAL_USER_ID
+                uid = str(call.get("PORTAL_USER_ID"))
                 
-                if "Unknown" in mgr: continue
+                # Ищем в маппинге
+                mgr_folder = MANAGERS_MAP.get(code, {}).get(uid, "Unknown")
                 
-                mgr_dir = os.path.join(DATA_DIR, folder, code, mgr)
+                if mgr_folder == "Unknown": continue # Пропускаем чужих
+                
+                # Создаем папки
+                mgr_dir = os.path.join(DATA_DIR, folder, code, mgr_folder)
                 os.makedirs(os.path.join(mgr_dir, "audio"), exist_ok=True)
                 os.makedirs(os.path.join(mgr_dir, "transcripts"), exist_ok=True)
                 os.makedirs(os.path.join(mgr_dir, "report"), exist_ok=True)
                 
+                # Имя файла
                 rec_url = call.get("CALL_RECORD_URL")
                 if not rec_url: continue
                 
@@ -111,9 +120,9 @@ def process_company(code, webhook, start, end, folder):
                 
                 if download_file(rec_url, target_path):
                     total += 1
-                    update_status(f"Скачан {code}: {fname}")
+                    update_status(f"Скачан {code}/{mgr_folder}: {fname}")
             
-            if "next" in data: 
+            if "next" in data:
                 next_start = data["next"]
                 time.sleep(0.5)
             else: break
@@ -129,7 +138,6 @@ def main():
     folder = f"{start.strftime('%Y-%m-%d')}_{end.strftime('%Y-%m-%d')}"
     
     os.makedirs(os.path.join(DATA_DIR, folder), exist_ok=True)
-    
     print(f"📂 Target Folder: {os.path.join(DATA_DIR, folder)}")
     
     c1 = process_company("UN", UN_WEBHOOK, start, end, folder)

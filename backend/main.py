@@ -104,10 +104,14 @@ def run_script(script_name, status_key):
         update_status("lasterror", str(e))
     finally:
         update_status(status_key, False)
+        # Используем синхронную версию для вызова из треда
         try:
-            asyncio.run(broadcast_event("refresh"))
-        except:
-            pass
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(broadcast_event("refresh"))
+            loop.close()
+        except Exception as e:
+            print(f"Broadcast error: {e}")
 # --- API ENDPOINTS ---
 
 @app.get("/api/status")
@@ -284,20 +288,28 @@ class AnalyzeRequest(BaseModel):
 def analyze_manager_endpoint(req: AnalyzeRequest):
     # Проверяем, есть ли отчет
     report_path = os.path.join(BASE_DIR, req.week, req.company, req.manager, "report", f"WEEKLY_REPORT_{req.manager}.json")
-    
+
     if os.path.exists(report_path) and not req.force:
         return {"status": "exists", "message": "Отчет уже существует. Перезаписать?"}
 
     # Запускаем в отдельном потоке (но статус будем писать локально для менеджера, это сложнее, пока просто запустим)
     # Чтобы не блокировать, запускаем тред
     def run():
-        update_status(f"analyzing_{req.manager}", True) # Флаг конкретного менеджера в статусе? Пока используем глобальный или просто лог
+        update_status(f"analyzing_{req.manager}", True)
         try:
             script = os.path.join(SCRIPTS_DIR, "analyze_manager.py")
             python = "/root/sales-ai-agent/venv/bin/python3"
             subprocess.run([python, script, "--week", req.week, "--company", req.company, "--manager", req.manager], check=True)
         finally:
             update_status(f"analyzing_{req.manager}", False)
+            # Broadcast after analysis completes
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(broadcast_event("refresh"))
+                loop.close()
+            except Exception as e:
+                print(f"Broadcast error: {e}")
 
     threading.Thread(target=run).start()
     return {"status": "started", "message": "Анализ запущен"}
